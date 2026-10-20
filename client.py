@@ -334,6 +334,20 @@ class AntigravityClient:
     def __exit__(self, *args: Any) -> None:
         self.close()
 
+    def cancel(self) -> None:
+        """Abort owned requests from another thread; leave full teardown to close().
+
+        Hermes poisons cancelled request clients. Stop their processes without
+        closing the owning thread's pipes or removing its live workspace.
+        """
+        with self._lock:
+            self.is_closed = True
+            self._terminate_worker_locked()
+            procs = tuple(self._active_processes)
+            self._active_processes.clear()
+        for proc in procs:
+            self._terminate_process(proc)
+
     def close(self) -> None:
         # Phase 1 -- terminate every child process BEFORE the workspace is
         # touched (issue #4): on Windows a still-running agy keeps
@@ -476,6 +490,8 @@ class AntigravityClient:
 
     def _get_or_spawn_worker(self, model: str, effort: str | None) -> subprocess.Popen:
         with self._lock:
+            if self.is_closed:
+                raise RuntimeError("AntigravityClient is closed.")
             if (
                 self._worker_proc is not None
                 and self._worker_proc.poll() is None
@@ -536,19 +552,25 @@ class AntigravityClient:
         if effort:
             cmd_args.extend(["--effort", effort])
 
-        proc = subprocess.Popen(
-            cmd_args,
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            bufsize=1,
-            cwd=self._cwd,
-            env=self._child_env(),
-            **_own_process_group(),
-        )
+        # Register the process under the same lock as cancel(): cancellation
+        # either prevents the spawn or sees the new owned request.
+        with self._lock:
+            if self.is_closed:
+                raise RuntimeError("AntigravityClient is closed.")
+            proc = subprocess.Popen(
+                cmd_args,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                bufsize=1,
+                cwd=self._cwd,
+                env=self._child_env(),
+                **_own_process_group(),
+            )
+            self._active_processes.add(proc)
 
         thinking_reader = ThinkingReader.before_request(self._isolated_gemini_dir)
         try:
@@ -558,9 +580,6 @@ class AntigravityClient:
                 proc.stdin.close()
         except OSError:
             pass
-
-        with self._lock:
-            self._active_processes.add(proc)
 
         stream_iter = AntigravityStream(
             proc=proc,
