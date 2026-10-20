@@ -32,6 +32,7 @@ from client import (
     resolve_agy_command,
 )
 from process import _check_early_quota_error
+from prompt import AntigravityPromptBudgetExceeded
 from stream import _is_output_limit_error, _result_reports_output_limit
 
 # Load the plugin's package entry as a real package (not a plain module) so its
@@ -290,7 +291,7 @@ class AntigravityPluginTests(unittest.TestCase):
         self.assertIn("call_123", prompt)
         self.assertIn("Tool Result (call_123):\n4", prompt)
 
-    def test_format_messages_strips_hallucinated_tool_results_and_emphasizes_user_query(self):
+    def test_format_messages_preserves_canonical_assistant_text_and_emphasizes_user_query(self):
         corrupted_messages = [
             {"role": "user", "content": "Initial query"},
             {
@@ -303,9 +304,8 @@ class AntigravityPluginTests(unittest.TestCase):
             {"role": "user", "content": "Why is this not following thread?"},
         ]
         prompt = _format_messages_as_prompt(corrupted_messages)
-        # Verify hallucinated tool result in assistant content was stripped
-        self.assertNotIn("fake data", prompt)
-        self.assertNotIn("Here is fake summary", prompt)
+        # The adapter preserves canonical history, including quoted tool text.
+        self.assertIn("Assistant:\nTool Result (call_1):\nfake data\nHere is fake summary", prompt)
         # Verify real tool result is present
         self.assertIn("Tool Result (call_1):\nreal data", prompt)
         # Verify latest user request is highlighted at tail
@@ -334,7 +334,7 @@ class AntigravityPluginTests(unittest.TestCase):
         d_prompt2 = _format_delta_prompt(tool_delta)
         self.assertIn("Continue the conversation from the latest tool result.", d_prompt2)
 
-    def test_format_messages_historical_tool_pruning(self):
+    def test_format_messages_preserves_historical_tools(self):
         messages = [{"role": "user", "content": "Start session"}]
         # Create 12 tool results, each 1000 characters
         for idx in range(12):
@@ -352,16 +352,11 @@ class AntigravityPluginTests(unittest.TestCase):
         messages.append({"role": "user", "content": "What is the status?"})
 
         prompt = _format_messages_as_prompt(messages)
-        # Older tools (indices 0 to 3) should be truncated
-        for idx in range(4):
-            self.assertIn(f"Tool Result (c_{idx}):", prompt)
-            self.assertIn("[... tool output truncated:", prompt)
-
-        # Recent tools (the last 8, indices 4 to 11) should remain intact (1000 X's)
-        for idx in range(4, 12):
+        for idx in range(12):
             self.assertIn(f"Tool Result (c_{idx}):\noutput_{idx}_" + ("X" * 1000), prompt)
+        self.assertNotIn("tool output truncated", prompt)
 
-    def test_format_messages_single_large_tool_capped(self):
+    def test_format_messages_single_large_tool_preserved(self):
         messages = [
             {"role": "user", "content": "Run big dump"},
             {"role": "assistant", "content": None, "tool_calls": [{"id": "c_big", "function": {"name": "big", "arguments": "{}"}}]},
@@ -369,19 +364,15 @@ class AntigravityPluginTests(unittest.TestCase):
             {"role": "user", "content": "Analyze"},
         ]
         prompt = _format_messages_as_prompt(messages)
-        self.assertIn("[... large tool output truncated: 25008 chars ...]", prompt)
-        self.assertIn("START", prompt)
-        self.assertIn("END", prompt)
+        self.assertIn("START" + ("Y" * 25000) + "END", prompt)
 
-    def test_format_delta_prompt_large_tool_capped(self):
+    def test_format_delta_prompt_large_tool_preserved(self):
         from client import _format_delta_prompt
         tool_delta = [{"role": "tool", "tool_call_id": "t_big", "content": "HEAD" + ("Z" * 25000) + "TAIL"}]
         d_prompt = _format_delta_prompt(tool_delta)
-        self.assertIn("[... large tool output truncated: 25008 chars ...]", d_prompt)
-        self.assertIn("HEAD", d_prompt)
-        self.assertIn("TAIL", d_prompt)
+        self.assertIn("HEAD" + ("Z" * 25000) + "TAIL", d_prompt)
 
-    def test_format_messages_budget_preserves_latest_user_request_and_evicts_oldest(self):
+    def test_format_messages_has_no_default_budget_and_rejects_explicit_overflow(self):
         messages: list[dict[str, object]] = [{"role": "user", "content": "Turn 1 initial modeling request"}]
         for idx in range(40):
             call_id = f"call_blender_{idx}"
@@ -406,22 +397,16 @@ class AntigravityPluginTests(unittest.TestCase):
         messages.append({"role": "user", "content": latest_req})
 
         prompt = _format_messages_as_prompt(messages)
-        self.assertLessEqual(len(prompt), 150000)
-        self.assertLessEqual(len(prompt.encode("utf-8")), 160000)
+        self.assertGreater(len(prompt), 150000)
         self.assertIn("### LATEST USER REQUEST TO ANSWER:", prompt)
         self.assertIn(latest_req, prompt)
         self.assertIn("Turn 1 final summary: 79 meshes complete.", prompt)
-        self.assertIn("truncated 60", prompt)
+        self.assertNotIn("[truncated", prompt)
+        self.assertNotIn("transcript messages omitted", prompt)
+        with self.assertRaises(AntigravityPromptBudgetExceeded):
+            _format_messages_as_prompt(messages, max_prompt_chars=40000, max_prompt_bytes=45000)
 
-        tight_prompt = _format_messages_as_prompt(messages, max_prompt_chars=40000, max_prompt_bytes=45000)
-        self.assertLessEqual(len(tight_prompt), 40000)
-        self.assertLessEqual(len(tight_prompt.encode("utf-8")), 45000)
-        self.assertIn("### LATEST USER REQUEST TO ANSWER:", tight_prompt)
-        self.assertIn(latest_req, tight_prompt)
-        self.assertIn("Turn 1 final summary: 79 meshes complete.", tight_prompt)
-        self.assertIn("earlier transcript messages omitted", tight_prompt)
-
-    def test_format_messages_budget_pins_active_user_request_on_mid_turn_tool_respawn(self):
+    def test_format_messages_respawn_preserves_all_tools_or_rejects_explicit_budget(self):
         active_user_req = "Improve the highlight and contrast of the remaining meshes first"
         messages: list[dict[str, object]] = [
             {"role": "user", "content": "Turn 1 old request"},
@@ -441,12 +426,13 @@ class AntigravityPluginTests(unittest.TestCase):
                 "content": f"tool_out_{idx}_" + ("C" * 4000),
             })
 
-        prompt = _format_messages_as_prompt(messages, max_prompt_chars=25000, max_prompt_bytes=28000)
-        self.assertLessEqual(len(prompt), 25000)
-        self.assertLessEqual(len(prompt.encode("utf-8")), 28000)
+        prompt = _format_messages_as_prompt(messages)
         self.assertIn(active_user_req, prompt)
         self.assertIn("### LATEST TOOL RESULTS RECEIVED.", prompt)
+        self.assertIn("tool_out_0_" + "C" * 4000, prompt)
         self.assertIn("tool_out_14_", prompt)
+        with self.assertRaises(AntigravityPromptBudgetExceeded):
+            _format_messages_as_prompt(messages, max_prompt_chars=25000, max_prompt_bytes=28000)
 
     def test_mock_stream_tool_call_suppresses_trailing_hallucination(self):
         # TemporaryDirectory (not /tmp): on Windows "/tmp" resolves to a
