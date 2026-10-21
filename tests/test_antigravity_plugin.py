@@ -1373,6 +1373,33 @@ class AntigravityPluginTests(unittest.TestCase):
         client._worker_lock.release()
         client.close()
 
+    def test_fallback_tool_extraction_preserves_explicit_output_limit(self):
+        # A closed outer bridge envelope can contain cut-off inner JSON.
+        # Extraction must never erase the provider's explicit length stop.
+        with tempfile.TemporaryDirectory() as directory:
+            client = AntigravityClient(cwd=directory)
+            self.addCleanup(client.close)
+            self.assertTrue(client._worker_lock.acquire(blocking=False))
+            self.addCleanup(client._worker_lock.release)
+            block = '<tool_call>' + json.dumps({
+                'function': {'name': 'tool_call', 'arguments': '{"calls":['}
+            }) + '</tool_call>'
+            events = [
+                json.dumps({'event': 'step_update', 'step_update': {'text_delta': block}}),
+                json.dumps({'event': 'result', 'result': {
+                    'status': 'ERROR', 'finish_reason': 'MAX_TOKENS',
+                }}),
+            ]
+            proc = self._scripted_proc(events, alive=False)
+            with patch('subprocess.Popen', return_value=proc):
+                completion = client.chat.completions.create(
+                    model='gemini-4-argon-medium',
+                    messages=[{'role': 'user', 'content': 'test'}],
+                    stream=False, timeout=30.0,
+                )
+            self.assertIsNotNone(completion.choices[0].message.tool_calls)
+            self.assertEqual(completion.choices[0].finish_reason, 'length')
+
     def test_output_limit_detection_matches_agy_sentences_only(self):
         for text in (
             "Your previous response was cut off because it exceeded the output token limit",
