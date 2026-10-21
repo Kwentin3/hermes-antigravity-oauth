@@ -1174,7 +1174,10 @@ def collect_stream_completion(stream: AntigravityStream, *, reasoning_emitter=No
         if extracted_calls:
             tool_calls = extracted_calls
             full_content = cleaned or None
-            finish_reason = "tool_calls"
+            # Extracting a tool envelope cannot turn a truncated response
+            # into a successful call. Preserve explicit provider stop reasons.
+            if finish_reason in (None, "stop"):
+                finish_reason = "tool_calls"
 
     message = SimpleNamespace(
         role="assistant",
